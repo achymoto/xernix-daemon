@@ -1,0 +1,63 @@
+# Wallet-layer 1.5% Transaction-Based Destruction
+#
+# Appends a burn destination to every outgoing transfer:
+#   burn_amount = floor(sum_of_amounts * 15 / 1000)
+#
+# This is WALLET-LAYER enforcement only. A user running an unpatched wallet
+# can bypass the burn until the rule is moved into consensus via a hard fork.
+#
+# Burn address read at runtime from:
+#   1. Env var XERNIX_BURN_ADDRESS (if set and non-empty)
+#   2. File   /etc/xernix/burn_address.txt
+# If neither is configured or the address is invalid for the active network,
+# the burn is skipped with a WARNING log and the transfer proceeds.
+#
+# See BURN_ADDRESS_GENERATION.md for the nothing-up-my-sleeve construction.
+# Pinned against MONERO_REF=v0.18.3.4.
+--- a/src/wallet/wallet2.cpp
++++ b/src/wallet/wallet2.cpp
+@@ -10560,6 +10560,44 @@
+   boost::unique_lock<hw::device> hwdev_lock (hwdev);
+   hw::reset_mode rst(hwdev);  
+ 
++  // ===================== XERNIX 1.5% TRANSACTION-BASED DESTRUCTION =====================
++  // Append a burn destination BEFORE original_dsts is captured so downstream
++  // sanity_check sees burn as part of the intended transaction shape.
++  // Bypass paths: sweep_all / sweep_below / dust sweep do not call
++  // create_transactions_2, so they are NOT burned (by design).
++  {
++    uint64_t xernix_burn_total = 0;
++    for (const auto &d : dsts) {
++      // 15 permille = 1.5%. Integer-safe: split high/low to avoid overflow on max u64 amounts.
++      xernix_burn_total += (d.amount / 1000) * 15 + ((d.amount % 1000) * 15) / 1000;
++    }
++    if (xernix_burn_total > 0) {
++      std::string xernix_burn_addr_str;
++      const char *env_addr = std::getenv("XERNIX_BURN_ADDRESS");
++      if (env_addr && *env_addr) {
++        xernix_burn_addr_str = env_addr;
++      } else {
++        std::ifstream f("/etc/xernix/burn_address.txt");
++        if (f) std::getline(f, xernix_burn_addr_str);
++      }
++      cryptonote::address_parse_info xernix_burn_info{};
++      if (!xernix_burn_addr_str.empty() &&
++          cryptonote::get_account_address_from_str(xernix_burn_info, m_nettype, xernix_burn_addr_str)) {
++        cryptonote::tx_destination_entry burn_dst{};
++        burn_dst.amount         = xernix_burn_total;
++        burn_dst.addr           = xernix_burn_info.address;
++        burn_dst.is_subaddress  = xernix_burn_info.is_subaddress;
++        burn_dst.is_integrated  = xernix_burn_info.has_payment_id;
++        dsts.push_back(burn_dst);
++        MINFO("[xernix] appended 1.5% burn destination: " << print_money(xernix_burn_total) << " -> " << xernix_burn_addr_str);
++      } else {
++        MWARNING("[xernix] no valid XERNIX_BURN_ADDRESS configured for network "
++                 << m_nettype << "; transfer proceeds WITHOUT burn enforcement");
++      }
++    }
++  }
++  // =================== END XERNIX TRANSACTION-BASED DESTRUCTION ===================
++
+   auto original_dsts = dsts;
+ 
+   if(m_light_wallet) {
